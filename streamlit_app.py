@@ -1,123 +1,156 @@
+import geopy
 import streamlit as st
 import pandas as pd
-import numpy as np
+import httpx
+import asyncio
+from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
 from sklearn.metrics import mean_squared_error, r2_score
-import altair as alt
 import time
 import zipfile
-
-# Page title
-st.set_page_config(page_title='ML Model Building', page_icon='🤖')
-st.title('🤖 ML Model Building')
-
-with st.expander('About this app'):
-  st.markdown('**What can this app do?**')
-  st.info('This app allow users to build a machine learning (ML) model in an end-to-end workflow. Particularly, this encompasses data upload, data pre-processing, ML model building and post-model analysis.')
-
-  st.markdown('**How to use the app?**')
-  st.warning('To engage with the app, go to the sidebar and 1. Select a data set and 2. Adjust the model parameters by adjusting the various slider widgets. As a result, this would initiate the ML model building process, display the model results as well as allowing users to download the generated models and accompanying data.')
-
-  st.markdown('**Under the hood**')
-  st.markdown('Data sets:')
-  st.code('''- Drug solubility data set
-  ''', language='markdown')
-  
-  st.markdown('Libraries used:')
-  st.code('''- Pandas for data wrangling
-- Scikit-learn for building a machine learning model
-- Altair for chart creation
-- Streamlit for user interface
-  ''', language='markdown')
+import altair as alt
+import geopandas as gpd
+import folium
+from geopy.geocoders import Nominatim
+from branca.colormap import linear
+import requests
+import certifi
+import ssl
 
 
-# Sidebar for accepting input parameters
-with st.sidebar:
-    # Load data
-    st.header('1.1. Input data')
 
-    st.markdown('**1. Use custom data**')
-    uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file, index_col=False)
-      
-    # Download example data
-    @st.cache_data
-    def convert_df(input_df):
-        return input_df.to_csv(index=False).encode('utf-8')
-    example_csv = pd.read_csv('https://raw.githubusercontent.com/dataprofessor/data/master/delaney_solubility_with_descriptors.csv')
-    csv = convert_df(example_csv)
-    st.download_button(
-        label="Download example CSV",
-        data=csv,
-        file_name='delaney_solubility_with_descriptors.csv',
-        mime='text/csv',
-    )
 
-    # Select example data
-    st.markdown('**1.2. Use example data**')
-    example_data = st.toggle('Load example data')
-    if example_data:
-        df = pd.read_csv('https://raw.githubusercontent.com/dataprofessor/data/master/delaney_solubility_with_descriptors.csv')
+async def fetch_data_async(title):
+    url = "https://data.cms.gov/data.json"
+    async with httpx.AsyncClient(timeout=None) as client:
+        response = await client.get(url)
+        response_data = response.json()
 
-    st.header('2. Set Parameters')
-    parameter_split_size = st.slider('Data split ratio (% for Training Set)', 10, 90, 80, 5)
+        dataset = response_data['dataset']
+        for dataset_entry in dataset:
+            if title == dataset_entry['title']:
+                for distro in dataset_entry['distribution']:
+                    if 'format' in distro and 'description' in distro:
+                        if distro['format'] == "API" and distro['description'] == "latest":
+                            latest_distro = distro['accessURL']
 
-    st.subheader('2.1. Learning Parameters')
-    with st.expander('See parameters'):
-        parameter_n_estimators = st.slider('Number of estimators (n_estimators)', 0, 1000, 100, 100)
-        parameter_max_features = st.select_slider('Max features (max_features)', options=['all', 'sqrt', 'log2'])
-        parameter_min_samples_split = st.slider('Minimum number of samples required to split an internal node (min_samples_split)', 2, 10, 2, 1)
-        parameter_min_samples_leaf = st.slider('Minimum number of samples required to be at a leaf node (min_samples_leaf)', 1, 10, 2, 1)
+        stats_endpoint = latest_distro + "/stats"
+        stats_response = await client.get(stats_endpoint)
+        stats_data = stats_response.json()
+        total_rows = stats_data['total_rows']
 
-    st.subheader('2.2. General Parameters')
-    with st.expander('See parameters', expanded=False):
-        parameter_random_state = st.slider('Seed number (random_state)', 0, 1000, 42, 1)
-        parameter_criterion = st.select_slider('Performance measure (criterion)', options=['squared_error', 'absolute_error', 'friedman_mse'])
-        parameter_bootstrap = st.select_slider('Bootstrap samples when building trees (bootstrap)', options=[True, False])
-        parameter_oob_score = st.select_slider('Whether to use out-of-bag samples to estimate the R^2 on unseen data (oob_score)', options=[False, True])
+        all_data = []
+        size = 5000
+        i = 0
+        while i < total_rows:
+            offset_url = f"{latest_distro}?size={size}&offset={i}"
+            offset_response = await client.get(offset_url)
+            print(f"Made request for {size} results at offset {i}")
+            data = offset_response.json()
+            all_data.extend(data)
+            i += size
 
-    sleep_time = st.slider('Sleep time', 0, 3, 0)
+    return all_data
 
-# Initiate the model building process
-if uploaded_file or example_data: 
-    with st.status("Running ...", expanded=True) as status:
+def remove_periods(df, columns_with_periods):
+    modified_df = df.copy()
+    for column in columns_with_periods:
+        modified_df.rename(columns={column: column.replace(".", "")}, inplace=True)
+    return modified_df
+
+async def main():
+    st.sidebar.title("Fetch CMS Dataset")
+    dataset_title = st.sidebar.text_input("Enter the dataset title")
+
+    if dataset_title:
+        all_data = await fetch_data_async(dataset_title)
+        df = pd.DataFrame(all_data)
+
+        st.subheader("DataFrame")
+        st.write(df.head())
+
+        st.sidebar.title("Column Cleanup")
+        columns_with_periods = st.sidebar.multiselect("Select columns containing periods", df.columns)
+
+        if columns_with_periods:
+            df_clean = remove_periods(df, columns_with_periods)
+            st.subheader("Modified DataFrame")
+            st.write(df_clean.head())
+
+            st.sidebar.title("Select Model Data")
+            excluded_columns = st.sidebar.multiselect("Select columns to exclude from subset", df_clean.columns)
+
+            if excluded_columns:
+                subset_df = df_clean.drop(columns=excluded_columns)
+                st.subheader("Subset DataFrame")
+                st.write(subset_df.head())
+
+                le = LabelEncoder()
+                for col in subset_df.select_dtypes(include=['object']):
+                    subset_df[col] = le.fit_transform(subset_df[col])
+
+                st.subheader("Encoded Subset DataFrame")
+                st.write(subset_df.head())
+
+                return subset_df, df
+
+    return None, None
+
+if __name__ == "__main__":
+    subset_df, df = asyncio.run(main())
+   # subset_df, df = main()
     
-        st.write("Loading data ...")
-        time.sleep(sleep_time)
+    if df is not None:
+        print(df.head())  # Example usage, replace this with your actual code
+    if subset_df is not None:
+        print(subset_df.head())  # Example usage, replace this with your actual code
+        # Rest of your Streamlit app code
 
-        st.write("Preparing data ...")
-        time.sleep(sleep_time)
-        X = df.iloc[:,:-1]
-        y = df.iloc[:,-1]
-            
-        st.write("Splitting data ...")
-        time.sleep(sleep_time)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=(100-parameter_split_size)/100, random_state=parameter_random_state)
-    
-        st.write("Model training ...")
-        time.sleep(sleep_time)
+        # User selects target variable (y)
+        target_variable = st.sidebar.selectbox('Select target variable (y)', subset_df.columns)
 
-        if parameter_max_features == 'all':
-            parameter_max_features = None
-            parameter_max_features_metric = X.shape[1]
+        st.sidebar.header('Set Parameters')
+
+        parameter_split_size = st.sidebar.slider('Data split ratio (percent for Training Set)', 10, 90, 80, 5)
+
+        st.sidebar.subheader('Learning Parameters')
+        with st.sidebar.expander('See parameters'):
+            parameter_n_estimators = st.slider('Number of boosting rounds (n_estimators)', 0, 1000, 100, 100)
+            parameter_max_depth = st.slider('Maximum tree depth (max_depth)', 1, 10, 3, 1)
+            parameter_learning_rate = st.slider('Learning rate (eta)', 0.01, 1.0, 0.1, 0.01)
+
+        sleep_time = st.slider('Sleep time', 0, 3, 0)
+
+        # Initiate the model building process
+        with st.status("Running ...", expanded=True) as status:
         
-        rf = RandomForestRegressor(
+            st.write("Loading data ...")
+            time.sleep(sleep_time)
+
+            st.write("Preparing data ...")
+            time.sleep(sleep_time)
+            X = subset_df.drop(columns=[target_variable])
+            y = subset_df[target_variable]
+                
+            st.write("Splitting data ...")
+            time.sleep(sleep_time)
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=(100-parameter_split_size)/100, random_state=42)
+        
+            st.write("Model training ...")
+            time.sleep(sleep_time)
+
+            xgb = XGBRegressor(
                 n_estimators=parameter_n_estimators,
-                max_features=parameter_max_features,
-                min_samples_split=parameter_min_samples_split,
-                min_samples_leaf=parameter_min_samples_leaf,
-                random_state=parameter_random_state,
-                criterion=parameter_criterion,
-                bootstrap=parameter_bootstrap,
-                oob_score=parameter_oob_score)
-        rf.fit(X_train, y_train)
+                max_depth=parameter_max_depth,
+                learning_rate=parameter_learning_rate
+            )
+            xgb.fit(X_train, y_train)
         
         st.write("Applying model to make predictions ...")
         time.sleep(sleep_time)
-        y_train_pred = rf.predict(X_train)
-        y_test_pred = rf.predict(X_test)
+        y_train_pred = xgb.predict(X_train)
+        y_test_pred = xgb.predict(X_test)
             
         st.write("Evaluating performance metrics ...")
         time.sleep(sleep_time)
@@ -128,122 +161,165 @@ if uploaded_file or example_data:
         
         st.write("Displaying performance metrics ...")
         time.sleep(sleep_time)
-        parameter_criterion_string = ' '.join([x.capitalize() for x in parameter_criterion.split('_')])
-        #if 'Mse' in parameter_criterion_string:
-        #    parameter_criterion_string = parameter_criterion_string.replace('Mse', 'MSE')
-        rf_results = pd.DataFrame(['Random forest', train_mse, train_r2, test_mse, test_r2]).transpose()
-        rf_results.columns = ['Method', f'Training {parameter_criterion_string}', 'Training R2', f'Test {parameter_criterion_string}', 'Test R2']
-        # Convert objects to numerics
-        for col in rf_results.columns:
-            rf_results[col] = pd.to_numeric(rf_results[col], errors='ignore')
-        # Round to 3 digits
+        rf_results = pd.DataFrame(['XGBoost', train_mse, train_r2, test_mse, test_r2]).transpose()
+        rf_results.columns = ['Method', 'Training MSE', 'Training R2', 'Test MSE', 'Test R2']
         rf_results = rf_results.round(3)
         
-    status.update(label="Status", state="complete", expanded=False)
+        status.update(label="Status", state="complete", expanded=False)
 
-    # Display data info
-    st.header('Input data', divider='rainbow')
-    col = st.columns(4)
-    col[0].metric(label="No. of samples", value=X.shape[0], delta="")
-    col[1].metric(label="No. of X variables", value=X.shape[1], delta="")
-    col[2].metric(label="No. of Training samples", value=X_train.shape[0], delta="")
-    col[3].metric(label="No. of Test samples", value=X_test.shape[0], delta="")
-    
-    with st.expander('Initial dataset', expanded=True):
-        st.dataframe(df, height=210, use_container_width=True)
-    with st.expander('Train split', expanded=False):
-        train_col = st.columns((3,1))
-        with train_col[0]:
-            st.markdown('**X**')
-            st.dataframe(X_train, height=210, hide_index=True, use_container_width=True)
-        with train_col[1]:
-            st.markdown('**y**')
-            st.dataframe(y_train, height=210, hide_index=True, use_container_width=True)
-    with st.expander('Test split', expanded=False):
-        test_col = st.columns((3,1))
-        with test_col[0]:
-            st.markdown('**X**')
-            st.dataframe(X_test, height=210, hide_index=True, use_container_width=True)
-        with test_col[1]:
-            st.markdown('**y**')
-            st.dataframe(y_test, height=210, hide_index=True, use_container_width=True)
+        # Display data info
+        st.header('Input data', divider='rainbow')
+        col = st.columns(4)
+        col[0].metric(label="No. of samples", value=X.shape[0], delta="")
+        col[1].metric(label="No. of X variables", value=X.shape[1], delta="")
+        col[2].metric(label="No. of Training samples", value=X_train.shape[0], delta="")
+        col[3].metric(label="No. of Test samples", value=X_test.shape[0], delta="")
+        
+        with st.expander('Initial dataset', expanded=True):
+            st.dataframe(subset_df, height=210, use_container_width=True)
+        with st.expander('Train split', expanded=False):
+            train_col = st.columns((3,1))
+            with train_col[0]:
+                st.markdown('**X**')
+                st.dataframe(X_train, height=210, hide_index=True, use_container_width=True)
+            with train_col[1]:
+                st.markdown('**y**')
+                st.dataframe(y_train, height=210, hide_index=True, use_container_width=True)
+        with st.expander('Test split', expanded=False):
+            test_col = st.columns((3,1))
+            with test_col[0]:
+                st.markdown('**X**')
+                st.dataframe(X_test, height=210, hide_index=True, use_container_width=True)
+            with test_col[1]:
+                st.markdown('**y**')
+                st.dataframe(y_test, height=210, hide_index=True, use_container_width=True)
 
-    # Zip dataset files
-    df.to_csv('dataset.csv', index=False)
-    X_train.to_csv('X_train.csv', index=False)
-    y_train.to_csv('y_train.csv', index=False)
-    X_test.to_csv('X_test.csv', index=False)
-    y_test.to_csv('y_test.csv', index=False)
-    
-    list_files = ['dataset.csv', 'X_train.csv', 'y_train.csv', 'X_test.csv', 'y_test.csv']
-    with zipfile.ZipFile('dataset.zip', 'w') as zipF:
-        for file in list_files:
-            zipF.write(file, compress_type=zipfile.ZIP_DEFLATED)
+        # Zip dataset files
+        subset_df.to_csv('dataset.csv', index=False)
+        X_train.to_csv('X_train.csv', index=False)
+        y_train.to_csv('y_train.csv', index=False)
+        X_test.to_csv('X_test.csv', index=False)
+        y_test.to_csv('y_test.csv', index=False)
 
-    with open('dataset.zip', 'rb') as datazip:
-        btn = st.download_button(
+        list_files = ['dataset.csv', 'X_train.csv', 'y_train.csv', 'X_test.csv', 'y_test.csv']
+        with zipfile.ZipFile('dataset.zip', 'w') as zipF:
+            for file in list_files:
+                zipF.write(file, compress_type=zipfile.ZIP_DEFLATED)
+
+        with open('dataset.zip', 'rb') as datazip:
+            btn = st.download_button(
                 label='Download ZIP',
                 data=datazip,
                 file_name="dataset.zip",
                 mime="application/octet-stream"
-                )
-    
-    # Display model parameters
-    st.header('Model parameters', divider='rainbow')
-    parameters_col = st.columns(3)
-    parameters_col[0].metric(label="Data split ratio (% for Training Set)", value=parameter_split_size, delta="")
-    parameters_col[1].metric(label="Number of estimators (n_estimators)", value=parameter_n_estimators, delta="")
-    parameters_col[2].metric(label="Max features (max_features)", value=parameter_max_features_metric, delta="")
-    
-    # Display feature importance plot
-    importances = rf.feature_importances_
-    feature_names = list(X.columns)
-    forest_importances = pd.Series(importances, index=feature_names)
-    df_importance = forest_importances.reset_index().rename(columns={'index': 'feature', 0: 'value'})
-    
-    bars = alt.Chart(df_importance).mark_bar(size=40).encode(
-             x='value:Q',
-             y=alt.Y('feature:N', sort='-x')
-           ).properties(height=250)
+            )
 
-    performance_col = st.columns((2, 0.2, 3))
-    with performance_col[0]:
-        st.header('Model performance', divider='rainbow')
-        st.dataframe(rf_results.T.reset_index().rename(columns={'index': 'Parameter', 0: 'Value'}))
-    with performance_col[2]:
+        # Display model parameters
+        st.header('Model parameters', divider='rainbow')
+        parameters_col = st.columns(3)
+        # parameters_col[0].metric(label="Data split ratio (% for Training Set)", value=parameter_split_size, delta="")
+        parameters_col[0].metric(label="Number of boosting rounds (n_estimators)", value=parameter_n_estimators,
+                                 delta="")
+        parameters_col[1].metric(label="Max tree depth (max_depth)", value=parameter_max_depth, delta="")
+        parameters_col[2].metric(label="Learning rate (eta)", value=parameter_learning_rate, delta="")
+
+        # Display feature importance plot
         st.header('Feature importance', divider='rainbow')
-        st.altair_chart(bars, theme='streamlit', use_container_width=True)
+        feature_importance = xgb.feature_importances_
+        feature_names = list(X.columns)
+        df_importance = pd.DataFrame({'Feature': feature_names, 'Importance': feature_importance})
+        df_importance = df_importance.sort_values(by='Importance', ascending=False)
 
-    # Prediction results
-    st.header('Prediction results', divider='rainbow')
-    s_y_train = pd.Series(y_train, name='actual').reset_index(drop=True)
-    s_y_train_pred = pd.Series(y_train_pred, name='predicted').reset_index(drop=True)
-    df_train = pd.DataFrame(data=[s_y_train, s_y_train_pred], index=None).T
-    df_train['class'] = 'train'
-        
-    s_y_test = pd.Series(y_test, name='actual').reset_index(drop=True)
-    s_y_test_pred = pd.Series(y_test_pred, name='predicted').reset_index(drop=True)
-    df_test = pd.DataFrame(data=[s_y_test, s_y_test_pred], index=None).T
-    df_test['class'] = 'test'
-    
-    df_prediction = pd.concat([df_train, df_test], axis=0)
-    
-    prediction_col = st.columns((2, 0.2, 3))
-    
-    # Display dataframe
-    with prediction_col[0]:
-        st.dataframe(df_prediction, height=320, use_container_width=True)
+        bars = alt.Chart(df_importance).mark_bar().encode(
+            x=alt.X('Importance:Q', axis=alt.Axis(title='Importance')),
+            y=alt.Y('Feature:N', sort='-x', axis=alt.Axis(title='Feature')),
+            color=alt.Color('Importance:Q', scale=alt.Scale(scheme='turbo'), legend=None)
+        ).properties(height=400)
 
-    # Display scatter plot of actual vs predicted values
-    with prediction_col[2]:
-        scatter = alt.Chart(df_prediction).mark_circle(size=60).encode(
-                        x='actual',
-                        y='predicted',
-                        color='class'
-                  )
-        st.altair_chart(scatter, theme='streamlit', use_container_width=True)
+        st.altair_chart(bars, use_container_width=True)
 
-    
-# Ask for CSV upload if none is detected
-else:
-    st.warning('👈 Upload a CSV file or click *"Load example data"* to get started!')
+        # Prediction results
+        st.header('Prediction results', divider='rainbow')
+        s_y_train = pd.Series(y_train, name='actual').reset_index(drop=True)
+        s_y_train_pred = pd.Series(y_train_pred, name='predicted').reset_index(drop=True)
+        df_train = pd.DataFrame(data=[s_y_train, s_y_train_pred], index=None).T
+        df_train['class'] = 'train'
+
+        s_y_test = pd.Series(y_test, name='actual').reset_index(drop=True)
+        s_y_test_pred = pd.Series(y_test_pred, name='predicted').reset_index(drop=True)
+        df_test = pd.DataFrame(data=[s_y_test, s_y_test_pred], index=None).T
+        df_test['class'] = 'test'
+
+        df_prediction = pd.concat([df_train, df_test], axis=0)
+
+        prediction_col = st.columns((2, 0.2, 3))
+
+        # Display dataframe
+        with prediction_col[0]:
+            st.dataframe(df_prediction, height=320, use_container_width=True)
+
+        # Display scatter plot of actual vs predicted values
+        with prediction_col[2]:
+            scatter = alt.Chart(df_prediction).mark_circle(size=60).encode(
+                x='actual',
+                y='predicted',
+                color='class'
+            )
+            st.altair_chart(scatter, use_container_width=True)
+
+        # Make predictions on the entire dataset
+        subset_df['Predicted'] = xgb.predict(X)
+
+        # Calculate residuals
+        subset_df['Residual'] = y - subset_df['Predicted']
+
+        df_with_predictions = pd.concat([df, subset_df[['Predicted', 'Residual']]], axis=1)
+
+        # Sort entities based on the residuals and select the top 50
+        top_residuals = df_with_predictions.nlargest(50, 'Residual')
+
+        # Display table containing entities with the largest residuals
+        st.header('Entities with the Largest Residuals')
+        st.table(top_residuals)
+
+        # Plot residuals vs predicted values in a scatter plot
+        scatter_pred_residuals = alt.Chart(subset_df).mark_circle(size=60).encode(
+            x='Predicted',
+            y='Residual',
+            tooltip=['Predicted', 'Residual']
+        ).properties(
+            width=800,
+            height=400
+        )
+        st.header('Predicted vs Residuals Scatter Plot')
+        st.altair_chart(scatter_pred_residuals, use_container_width=True)
+
+            # Select city and state columns for longitude and latitude
+        selected_columns = st.multiselect("Select columns for longitude and latitude", df.columns)
+        if selected_columns:
+            # Concatenate city and state columns to derive longitude and latitude
+            location_df = df_with_predictions[selected_columns]
+            # Perform any necessary data cleaning or transformation to derive longitude and latitude
+
+            ctx = ssl.create_default_context(cafile=certifi.where())
+            geopy.geocoders.options.default_ssl_context = ctx
+
+            # Create a geocoder object with the custom session
+            geolocator = Nominatim(user_agent="my_geocoder", timeout=10)
+
+            # Geocode addresses to get latitude and longitude coordinates
+            location_df['Location'] = location_df.apply(geolocator.geocode)
+
+            # Extract latitude and longitude coordinates from the Location column
+            location_df['Latitude'] = location_df['Location'].apply(lambda loc: loc.latitude if loc else None)
+            location_df['Longitude'] = location_df['Location'].apply(lambda loc: loc.longitude if loc else None)
+
+            # Plot map with top residuals
+            #st.subheader("Map with Top Residuals")
+            #top_residuals = df_with_predictions.nlargest(50, 'Residual')  # Get top 50 residuals
+            st.map(location_df, latitude='Latitude',longitude='Longitude',color='Residuals')  # Plot top residuals on a map
+
+        # Display the DataFrame with predictions and residuals
+        #st.subheader("DataFrame with Predictions and Residuals")
+        #st.write(df_with_predictions)
+
